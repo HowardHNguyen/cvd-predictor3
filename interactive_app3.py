@@ -453,7 +453,7 @@ with st.expander("About this model and comparison to MDCalc-style tools"):
 
 st.markdown(
     "<p style='text-align:center; color:gray; margin-top:2rem;'>"
-    "© 2025 – Stacking Generative AI CVD Risk Prototype (Demonstration Use Only)"
+    "© 2025. Howard Nguyen, PhD – Stacking Generative AI CVD Risk Prototype (Demonstration Use Only)"
     "</p>",
     unsafe_allow_html=True,
 )
