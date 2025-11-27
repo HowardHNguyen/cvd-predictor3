@@ -371,38 +371,6 @@ with right:
 
     st.markdown("### Treatment Impact & NNT (Illustrative)")
 
-    # ===========================
-    # Explanation: Why results differ from MDCalc
-    # ===========================
-    with st.expander("Why results differ from MDCalc?"):
-        st.markdown("""
-    ### Why Your Results May Differ from MDCalc
-
-    MDCalc uses the SCORE2 equation, a guideline-calibrated model based on large European cohorts.  
-    Your Stacking GenAI model is trained on a GAN-balanced Framingham dataset and behaves differently for several reasons:
-
-    **1. Population Basis**
-    - **MDCalc (SCORE2):** higher European baseline risk  
-    - **Predictor v3:** U.S. Framingham + GAN-balanced  
-
-    **2. Medication Interpretation**
-    - MDCalc reduces predicted risk if medications (statins or BP meds) are used  
-    - Predictor v3 learned real-world patterns: medication use often signals long-standing disease or more severe risk profiles  
-
-    **3. Nonlinear Modeling**
-    - MDCalc uses fixed linear/logarithmic equations  
-    - Predictor v3 captures nonlinear interactions (e.g., diabetes + smoking + high SBP), producing sharper increases in risk  
-
-    **4. Sensitivity**
-    - MDCalc provides conservative, smoothed estimates  
-    - Predictor v3 is more sensitive and individualized based on combined risk factor patterns  
-
-    **Conclusion:**  
-    MDCalc is best for guideline-aligned population estimates.  
-    Predictor v3 is best for individualized, data-driven predictions with high accuracy (AUC=0.93).
-    """)
-
-
     st.markdown(
         f"Assuming a **{RISK_HORIZON_YEARS}-year** time horizon and typical relative risk "
         "reductions from large trials. Values are approximate and for educational use only."
@@ -440,6 +408,37 @@ with right:
             "25 patients with a similar profile for the specified duration prevents about "
             "one additional CVD event on average."
         )
+
+    # ===========================
+    # Explanation: Why results differ from MDCalc
+    # ===========================
+    with st.expander("Why results differ from MDCalc?"):
+        st.markdown("""
+    ### Why Your Results May Differ from MDCalc
+
+    MDCalc uses the SCORE2 equation, a guideline-calibrated model based on large European cohorts.  
+    Your Stacking GenAI model is trained on a GAN-balanced Framingham dataset and behaves differently for several reasons:
+
+    **1. Population Basis**
+    - **MDCalc (SCORE2):** higher European baseline risk  
+    - **Predictor v3:** U.S. Framingham + GAN-balanced  
+
+    **2. Medication Interpretation**
+    - MDCalc reduces predicted risk if medications (statins or BP meds) are used  
+    - Predictor v3 learned real-world patterns: medication use often signals long-standing disease or more severe risk profiles  
+
+    **3. Nonlinear Modeling**
+    - MDCalc uses fixed linear/logarithmic equations  
+    - Predictor v3 captures nonlinear interactions (e.g., diabetes + smoking + high SBP), producing sharper increases in risk  
+
+    **4. Sensitivity**
+    - MDCalc provides conservative, smoothed estimates  
+    - Predictor v3 is more sensitive and individualized based on combined risk factor patterns  
+
+    **Conclusion:**  
+    MDCalc is best for guideline-aligned population estimates.  
+    Predictor v3 is best for individualized, data-driven predictions with high accuracy (AUC=0.93).
+    """)
 
 # -------------------------------------------------------------------
 # FOOTER / ABOUT
