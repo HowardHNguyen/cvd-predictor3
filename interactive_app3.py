@@ -1,44 +1,50 @@
-import os
 import numpy as np
 import pandas as pd
 import streamlit as st
+import joblib
+import tensorflow as tf
 
-from sklearn.compose import ColumnTransformer
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, brier_score_loss
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
 
-# ============================================================
-# Page config
-# ============================================================
+# -------------------------------------------------------------------
+# CONFIG
+# -------------------------------------------------------------------
 st.set_page_config(
-    page_title="CVD 10-Year Risk – Predictor v3 (Synthetic 10K + NNT)",
+    page_title="CVD Risk – Predictor v3 (Stacking GenAI)",
     layout="wide"
 )
 
-# ------------------------------------------------------------
-# Constants
-# ------------------------------------------------------------
-DATA_PATH = "synthetic_cvd_10000.csv"  # <--- your new dataset
+DATA_PATH = "framingham_minimal.csv"
 
 RISK_HORIZON_YEARS = 10
+RRR_STATIN = 0.25   # 25% relative risk reduction
+RRR_BP = 0.20       # 20% relative risk reduction
 
-# Relative risk reductions (RRR) for treatment impact / NNT
-RRR_STATIN = 0.25          # ~25% relative reduction
-RRR_BP = 0.20              # ~20% relative reduction (optimized BP meds)
+# These are the 11 inputs you defined
+UI_FEATURES = [
+    "gender",
+    "age",
+    "total_cholesterol",
+    "hdl_cholesterol",
+    "sbp",
+    "diabetes",
+    "smoker",
+    "egfr",
+    "anti_htn_med",
+    "statin_use",
+    "bmi",
+]
 
-# ============================================================
-# Helper functions
-# ============================================================
+TARGET_COL = "cvd_event"
+
+
+# -------------------------------------------------------------------
+# UTILS
+# -------------------------------------------------------------------
 def format_percent(p: float) -> str:
     return f"{p * 100:.1f}%"
 
-
-def get_risk_category(p: float):
-    """
-    Basic 10-year ASCVD-style categories.
-    """
+def risk_category_label(p: float):
     if p < 0.05:
         return "Low risk (<5%) – lifestyle focus", "green"
     elif p < 0.075:
@@ -48,313 +54,307 @@ def get_risk_category(p: float):
     else:
         return "High (≥20%) – strong indication for therapy", "red"
 
-
-def treatment_impact(baseline_risk: float, rrr: float, horizon_years: int = 10):
-    """
-    Simple treatment impact model:
-    - baseline_risk: model-predicted probability (0–1)
-    - rrr: relative risk reduction (0–1)
-    Returns treated risk, ARR, NNT.
-    """
+def treatment_impact(baseline_risk: float, rrr: float):
+    # baseline_risk and rrr are decimals (0–1)
     treated_risk = baseline_risk * (1.0 - rrr)
     arr = baseline_risk - treated_risk
-
-    if arr <= 0:
-        nnt = None
-    else:
-        nnt = 1.0 / arr
-
+    nnt = None if arr <= 0 else 1.0 / arr
     return treated_risk, arr, nnt
 
-
-def local_jitter_uncertainty(model, base_row: pd.DataFrame, n_samples: int = 200):
-    """
-    Approximate local uncertainty by jittering numeric predictors slightly
-    and recomputing risk N times. Returns (low, median, high) 5–50–95%.
-    """
-    rows = pd.concat([base_row] * n_samples, ignore_index=True)
-
-    rng = np.random.default_rng(42)
-
-    # Jitter numeric fields
-    rows["age"] = np.clip(
-        rows["age"] + rng.normal(0, 1, n_samples), 30, 80
-    ).round().astype(int)
-
-    rows["total_cholesterol"] = np.clip(
-        rows["total_cholesterol"] + rng.normal(0, 10, n_samples), 120, 320
-    ).round().astype(int)
-
-    rows["hdl_cholesterol"] = np.clip(
-        rows["hdl_cholesterol"] + rng.normal(0, 4, n_samples), 25, 90
-    ).round().astype(int)
-
-    rows["sbp"] = np.clip(
-        rows["sbp"] + rng.normal(0, 5, n_samples), 90, 200
-    ).round().astype(int)
-
-    rows["egfr"] = np.clip(
-        rows["egfr"] + rng.normal(0, 5, n_samples), 30, 120
-    ).round().astype(int)
-
-    rows["bmi"] = np.clip(
-        rows["bmi"] + rng.normal(0, 0.7, n_samples), 18.0, 45.0
-    )
-
-    probs = model.predict_proba(rows)[:, 1]
-    low, med, high = np.percentile(probs, [5, 50, 95])
-    return float(low), float(med), float(high)
-
-
 def get_percentile(prob: float, dist: np.ndarray) -> float:
-    """Return percentile (0–1) of prob within distribution dist."""
+    """Return percentile of prob within distribution dist."""
     return float((dist <= prob).mean())
 
+def jitter_samples(row: pd.DataFrame, n: int = 200):
+    """Generate jittered versions of a single-row DataFrame."""
+    rng = np.random.default_rng(42)
+    rows = pd.concat([row] * n, ignore_index=True)
 
-# ============================================================
-# Data loading + synthetic label generation
-# ============================================================
-@st.cache_data(show_spinner=False)
-def load_dataset(path: str):
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Dataset {path} not found. Please place synthetic_cvd_10000.csv "
-            f"in the same folder as this app."
-        )
+    # Numeric jitter with safe clinical ranges
+    rows["age"] = np.clip(rows["age"] + rng.normal(0, 1.5, n), 30, 80).round()
+    rows["total_cholesterol"] = np.clip(
+        rows["total_cholesterol"] + rng.normal(0, 10, n), 130, 320
+    ).round()
+    rows["hdl_cholesterol"] = np.clip(
+        rows["hdl_cholesterol"] + rng.normal(0, 3, n), 20, 90
+    ).round()
+    rows["sbp"] = np.clip(rows["sbp"] + rng.normal(0, 5, n), 90, 220).round()
+    rows["bmi"] = np.clip(rows["bmi"] + rng.normal(0, 1.0, n), 16, 45)
+    rows["egfr"] = np.clip(rows["egfr"] + rng.normal(0, 5, n), 20, 120)
+
+    # Binary fields (diabetes, smoker, anti_htn_med, statin_use) kept fixed
+    return rows
+
+
+# -------------------------------------------------------------------
+# LOAD DATA & MODELS
+# -------------------------------------------------------------------
+@st.cache_data(show_spinner=True)
+def load_minimal_data(path: str):
     df = pd.read_csv(path)
-
-    # Expect columns:
-    # gender, age, total_cholesterol, hdl_cholesterol, sbp,
-    # diabetes, smoker, egfr, anti_hypertensive_med, statin_use, bmi
-
-    # If no outcome column, generate a synthetic CVD event label
-    if "cvd_event" not in df.columns:
-        rng = np.random.default_rng(2025)
-
-        age = df["age"].to_numpy()
-        chol = df["total_cholesterol"].to_numpy()
-        hdl = df["hdl_cholesterol"].to_numpy()
-        sbp = df["sbp"].to_numpy()
-        bmi = df["bmi"].to_numpy()
-        egfr = df["egfr"].to_numpy()
-
-        diabetes = (df["diabetes"].str.upper() == "YES").astype(int).to_numpy()
-        smoker = (df["smoker"].str.upper() == "YES").astype(int).to_numpy()
-        anti_htn = (df["anti_hypertensive_med"].str.upper() == "YES").astype(int).to_numpy()
-        statin = (df["statin_use"].str.upper() == "YES").astype(int).to_numpy()
-
-        # Simple, hand-crafted risk equation (logistic model)
-        logit = (
-            -7.5
-            + 0.04 * (age - 55)
-            + 0.018 * (sbp - 130)
-            + 0.010 * (chol - 190)
-            - 0.025 * (hdl - 45)
-            + 0.30 * diabetes
-            + 0.35 * smoker
-            + 0.015 * (bmi - 27)
-            - 0.015 * (egfr - 90)
-            + 0.20 * (1 - anti_htn)   # higher risk if NOT on BP meds
-            + 0.20 * (1 - statin)     # higher risk if NOT on statin
-        )
-
-        p = 1.0 / (1.0 + np.exp(-logit))
-        p = np.clip(p, 0.01, 0.80)
-        df["cvd_event"] = rng.binomial(1, p)
-
+    # Make sure expected columns are there
+    df = df[UI_FEATURES + [TARGET_COL]].dropna()
+    df["cvd_event"] = df[TARGET_COL].astype(int)
     return df
 
-
-# ============================================================
-# Model training (Logistic Regression with preprocessing)
-# ============================================================
 @st.cache_resource(show_spinner=True)
-def train_model(df: pd.DataFrame):
-    target = "cvd_event"
+def load_models_and_metadata():
+    # Load models
+    scaler = joblib.load("stack_scaler.pkl")
+    rf_model = joblib.load("stack_rf.pkl")
+    xgb_model = joblib.load("stack_xgb.pkl")
+    meta_model = joblib.load("stack_meta.pkl")
+    cnn_model = tf.keras.models.load_model("stack_cnn.h5")
 
-    feature_cols = [
-        "gender",
-        "age",
-        "total_cholesterol",
-        "hdl_cholesterol",
-        "sbp",
-        "diabetes",
-        "smoker",
-        "egfr",
-        "anti_hypertensive_med",
-        "statin_use",
-        "bmi",
-    ]
+    # Load minimal dataset for distribution & feature layout
+    df = load_minimal_data(DATA_PATH)
+    y = df[TARGET_COL].values
 
-    X = df[feature_cols].copy()
-    y = df[target].astype(int).to_numpy()
+    # One-hot encode gender for training layout
+    X_raw = df[UI_FEATURES].copy()
+    X_encoded = pd.get_dummies(X_raw, columns=["gender"], drop_first=True)
+    feature_cols = X_encoded.columns.tolist()
 
-    cat_cols = [
-        "gender",
-        "diabetes",
-        "smoker",
-        "anti_hypertensive_med",
-        "statin_use",
-    ]
-    num_cols = [c for c in feature_cols if c not in cat_cols]
+    # Align & scale
+    X_scaled = scaler.transform(X_encoded[feature_cols])
+    X_cnn = X_scaled.reshape((X_scaled.shape[0], X_scaled.shape[1], 1))
 
-    pre = ColumnTransformer(
-        transformers=[
-            ("cat", OneHotEncoder(drop="first"), cat_cols),
-            ("num", "passthrough", num_cols),
-        ]
-    )
+    # Base model predictions
+    rf_probs = rf_model.predict_proba(X_scaled)[:, 1]
+    xgb_probs = xgb_model.predict_proba(X_scaled)[:, 1]
+    cnn_probs = cnn_model.predict(X_cnn).ravel()
 
-    lr = LogisticRegression(max_iter=1000)
-    pipe = Pipeline([("pre", pre), ("lr", lr)])
-    pipe.fit(X, y)
+    # Stacking meta-learner
+    meta_X = np.column_stack([rf_probs, xgb_probs, cnn_probs])
+    stack_probs = meta_model.predict_proba(meta_X)[:, 1]
 
-    # In-sample performance (synthetic; just for display)
-    preds = pipe.predict_proba(X)[:, 1]
-    auc = roc_auc_score(y, preds)
-    brier = brier_score_loss(y, preds)
+    # Metrics
+    metrics = {}
+    for label, probs in [
+        ("Random Forest", rf_probs),
+        ("XGBoost", xgb_probs),
+        ("CNN", cnn_probs),
+        ("Stacking GenAI", stack_probs),
+    ]:
+        auc = roc_auc_score(y, probs)
+        brier = brier_score_loss(y, probs)
+        metrics[label] = {"AUC": auc, "Brier": brier}
 
-    metrics = {"AUC": auc, "Brier": brier}
-    return pipe, metrics, preds
+    prevalence = y.mean()
+
+    return {
+        "scaler": scaler,
+        "rf": rf_model,
+        "xgb": xgb_model,
+        "cnn": cnn_model,
+        "meta": meta_model,
+        "feature_cols": feature_cols,
+        "df": df,
+        "y": y,
+        "rf_probs": rf_probs,
+        "xgb_probs": xgb_probs,
+        "cnn_probs": cnn_probs,
+        "stack_probs": stack_probs,
+        "metrics": metrics,
+        "prevalence": prevalence,
+    }
+
+def encode_for_model(df_small: pd.DataFrame, feature_cols):
+    """
+    Encode a DataFrame with columns == UI_FEATURES
+    into the same numeric layout used in training.
+    """
+    temp = df_small.copy()
+    temp = pd.get_dummies(temp, columns=["gender"], drop_first=True)
+    # Align to training feature_cols, fill missing with 0
+    temp = temp.reindex(columns=feature_cols, fill_value=0)
+    return temp
 
 
-# ============================================================
-# Load data + train model
-# ============================================================
-df = load_dataset(DATA_PATH)
-MODEL, METRICS, RISK_DIST = train_model(df)
-PREVALENCE = df["cvd_event"].mean()
+def predict_stack_single(models_meta, row: pd.DataFrame) -> float:
+    """Predict CVD risk for a single-row UI-feature DataFrame using stacking model."""
+    scaler = models_meta["scaler"]
+    rf_model = models_meta["rf"]
+    xgb_model = models_meta["xgb"]
+    cnn_model = models_meta["cnn"]
+    meta_model = models_meta["meta"]
+    feature_cols = models_meta["feature_cols"]
 
-# ============================================================
-# Sidebar: inputs
-# ============================================================
+    X_enc = encode_for_model(row, feature_cols)
+    X_scaled = scaler.transform(X_enc)
+    X_cnn = X_scaled.reshape((X_scaled.shape[0], X_scaled.shape[1], 1))
+
+    rf_p = rf_model.predict_proba(X_scaled)[:, 1]
+    xgb_p = xgb_model.predict_proba(X_scaled)[:, 1]
+    cnn_p = cnn_model.predict(X_cnn).ravel()
+
+    meta_X = np.column_stack([rf_p, xgb_p, cnn_p])
+    stack_p = meta_model.predict_proba(meta_X)[:, 1][0]
+    return float(stack_p)
+
+
+def predict_stack_bulk(models_meta, df_rows: pd.DataFrame) -> np.ndarray:
+    """Predict for many rows at once (used for distribution & jitter)."""
+    scaler = models_meta["scaler"]
+    rf_model = models_meta["rf"]
+    xgb_model = models_meta["xgb"]
+    cnn_model = models_meta["cnn"]
+    meta_model = models_meta["meta"]
+    feature_cols = models_meta["feature_cols"]
+
+    X_enc = encode_for_model(df_rows, feature_cols)
+    X_scaled = scaler.transform(X_enc)
+    X_cnn = X_scaled.reshape((X_scaled.shape[0], X_scaled.shape[1], 1))
+
+    rf_p = rf_model.predict_proba(X_scaled)[:, 1]
+    xgb_p = xgb_model.predict_proba(X_scaled)[:, 1]
+    cnn_p = cnn_model.predict(X_cnn).ravel()
+    meta_X = np.column_stack([rf_p, xgb_p, cnn_p])
+    stack_p = meta_model.predict_proba(meta_X)[:, 1]
+    return stack_p
+
+
+# -------------------------------------------------------------------
+# LOAD EVERYTHING
+# -------------------------------------------------------------------
+MODELS_META = load_models_and_metadata()
+STACK_DIST = MODELS_META["stack_probs"]
+METRICS = MODELS_META["metrics"]
+PREVALENCE = MODELS_META["prevalence"]
+
+
+# -------------------------------------------------------------------
+# SIDEBAR – PATIENT INPUTS
+# -------------------------------------------------------------------
 with st.sidebar:
-    st.markdown("### Dataset status")
-    st.success(
-        f"Rows: **{len(df):,}**  \n"
-        f"Prevalence (CVD event): **{PREVALENCE*100:.1f}%**"
-    )
+    st.markdown("### Patient Inputs")
 
-    st.markdown("---")
-    st.markdown("### Patient Profile")
+    gender = st.radio("Gender", ["Male", "Female"], index=0, horizontal=True)
+    age = st.slider("Age (years)", 30, 80, 55)
 
-    gender = st.radio("Sex", ["Male", "Female"], index=0, horizontal=True)
+    total_cholesterol = st.slider("Total cholesterol (mg/dL)", 130, 320, 200)
+    hdl_cholesterol = st.slider("HDL cholesterol (mg/dL)", 20, 90, 45)
 
-    age = st.slider("Age", 30, 80, 55, step=1)
-
-    total_chol = st.slider("Total cholesterol (mg/dL)", 120, 320, 190, step=1)
-    hdl = st.slider("HDL cholesterol (mg/dL)", 25, 90, 45, step=1)
-
-    sbp = st.slider("Systolic BP (mmHg)", 90, 200, 130, step=1)
+    sbp = st.slider("Systolic BP (mmHg)", 90, 220, 130)
 
     diabetes = st.radio("Diabetes", ["No", "Yes"], index=0, horizontal=True)
     smoker = st.radio("Current smoker", ["No", "Yes"], index=0, horizontal=True)
 
-    egfr = st.slider("eGFR (mL/min/1.73 m²)", 30, 120, 90, step=1)
+    egfr = st.slider("eGFR (mL/min/1.73 m²)", 20, 120, 90)
 
-    anti_htn = st.radio(
-        "Using anti-hypertensive medication", ["No", "Yes"], index=0, horizontal=True
-    )
-    statin_use = st.radio(
-        "Using statins", ["No", "Yes"], index=0, horizontal=True
-    )
+    anti_htn_med = st.radio("Using anti-hypertensive medication", ["No", "Yes"], index=0, horizontal=True)
+    statin_use = st.radio("Using statin therapy", ["No", "Yes"], index=0, horizontal=True)
 
-    bmi = st.slider("BMI (kg/m²)", 18.0, 45.0, 27.0, step=0.1)
+    bmi = st.slider("BMI (kg/m²)", 16.0, 45.0, 27.0, step=0.1)
 
     st.markdown("---")
-    show_advanced = st.checkbox(
-        "Show advanced metrics (uncertainty, NNT details)",
-        value=True,
-    )
+    show_advanced = st.checkbox("Show advanced metrics", value=True)
 
-# Build single-row DataFrame for prediction
-input_row = pd.DataFrame(
-    [{
-        "gender": gender,
-        "age": age,
-        "total_cholesterol": total_chol,
-        "hdl_cholesterol": hdl,
-        "sbp": sbp,
-        "diabetes": diabetes,
-        "smoker": smoker,
-        "egfr": egfr,
-        "anti_hypertensive_med": anti_htn,
-        "statin_use": statin_use,
-        "bmi": bmi,
-    }]
-)
 
-# ============================================================
-# Main layout
-# ============================================================
-st.title("CVD 10-Year Risk – Predictor v3 (Synthetic 10K + NNT)")
+# Build a single-row DataFrame with UI features
+input_row = pd.DataFrame([{
+    "gender": gender,
+    "age": float(age),
+    "total_cholesterol": float(total_cholesterol),
+    "hdl_cholesterol": float(hdl_cholesterol),
+    "sbp": float(sbp),
+    "diabetes": 1 if diabetes == "Yes" else 0,
+    "smoker": 1 if smoker == "Yes" else 0,
+    "egfr": float(egfr),
+    "anti_htn_med": 1 if anti_htn_med == "Yes" else 0,
+    "statin_use": 1 if statin_use == "Yes" else 0,
+    "bmi": float(bmi),
+}])
+
+# -------------------------------------------------------------------
+# MAIN – PREDICTION
+# -------------------------------------------------------------------
+st.title("CVD 10-Year Risk – Predictor v3 (Minimal Features + Stacking GenAI)")
 st.caption(
-    "Educational demo using a 10,000-record synthetic CVD risk-factor dataset. "
-    "This is **not** a medical device and must not be used for real patient care."
+    "This tool estimates 10-year cardiovascular risk using a Stacking Generative AI model "
+    "trained on a minimal Framingham-based dataset (age, lipids, BP, diabetes, smoking, BMI, "
+    "eGFR, medications). Educational use only – not a medical device."
 )
 
-left, right = st.columns([1.1, 1.9])
+left, right = st.columns([1.2, 1.8])
 
-with st.spinner("Computing risk and uncertainty..."):
-    prob = float(MODEL.predict_proba(input_row)[:, 1])
-    low_u, med_u, high_u = local_jitter_uncertainty(MODEL, input_row, n_samples=200)
-    percentile = get_percentile(prob, RISK_DIST)
+with st.spinner("Computing risk, uncertainty, and NNT..."):
+    # Single-patient prediction
+    risk = predict_stack_single(MODELS_META, input_row)
 
-risk_label, risk_color = get_risk_category(prob)
+    # Local uncertainty with jitter
+    jitter_df = jitter_samples(input_row, n=200)
+    jitter_probs = predict_stack_bulk(MODELS_META, jitter_df)
+    low_u, med_u, high_u = np.percentile(jitter_probs, [5, 50, 95])
 
-# ------------------------------------------------------------
-# LEFT: summary & model metrics
-# ------------------------------------------------------------
+    # Percentile vs training cohort
+    percentile = get_percentile(risk, STACK_DIST)
+
+risk_label, risk_color = risk_category_label(risk)
+
+# -------------------------------------------------------------------
+# LEFT COLUMN – INPUT SUMMARY & MODEL INFO
+# -------------------------------------------------------------------
 with left:
     st.subheader("Input Summary")
 
     st.markdown(
-        f"- **Sex:** {gender}  \n"
+        f"- **Gender:** {gender}  \n"
         f"- **Age:** {age} years  \n"
-        f"- **Total cholesterol:** {total_chol} mg/dL  \n"
-        f"- **HDL cholesterol:** {hdl} mg/dL  \n"
+        f"- **Total cholesterol:** {total_cholesterol} mg/dL  \n"
+        f"- **HDL cholesterol:** {hdl_cholesterol} mg/dL  \n"
         f"- **Systolic BP:** {sbp} mmHg  \n"
         f"- **Diabetes:** {diabetes}  \n"
-        f"- **Current smoker:** {smoker}  \n"
+        f"- **Smoker:** {smoker}  \n"
         f"- **eGFR:** {egfr} mL/min/1.73 m²  \n"
-        f"- **Anti-hypertensive medication:** {anti_htn}  \n"
+        f"- **Anti-hypertensive meds:** {anti_htn_med}  \n"
         f"- **Statin use:** {statin_use}  \n"
         f"- **BMI:** {bmi:.1f} kg/m²"
     )
 
     st.markdown("---")
-    st.markdown("### Model Performance (synthetic)")
+    st.markdown("### Model Performance (on training cohort)")
 
+    m = METRICS["Stacking GenAI"]
     st.markdown(
-        f"- **Logistic Regression (internal):**  \n"
-        f"  - ROC AUC: **{METRICS['AUC']:.3f}**  \n"
-        f"  - Brier score: **{METRICS['Brier']:.3f}**  \n"
-        f"- **Training prevalence:** {format_percent(PREVALENCE)}"
+        f"- **Model:** Stacking GenAI (RF + XGB + CNN + meta LR)  \n"
+        f"- **ROC AUC:** **{m['AUC']:.3f}**  \n"
+        f"- **Brier score:** **{m['Brier']:.3f}**  \n"
+        f"- **Outcome prevalence:** {format_percent(PREVALENCE)}"
     )
+
+    if show_advanced:
+        st.markdown("---")
+        st.markdown("### Base Model Metrics")
+        st.markdown(
+            f"- **Random Forest AUC:** {METRICS['Random Forest']['AUC']:.3f}  \n"
+            f"- **XGBoost AUC:** {METRICS['XGBoost']['AUC']:.3f}  \n"
+            f"- **CNN AUC:** {METRICS['CNN']['AUC']:.3f}"
+        )
 
     st.markdown("---")
     st.markdown("### Risk Context in Cohort")
     st.markdown(
-        f"- **Predicted 10-year risk:** {format_percent(prob)}  \n"
-        f"- **Percentile in synthetic cohort:** ~**{percentile*100:.0f}th** percentile."
+        f"- **Predicted {RISK_HORIZON_YEARS}-year risk:** {format_percent(risk)}  \n"
+        f"- **Percentile vs training cohort:** ~**{percentile * 100:.0f}th** percentile"
     )
 
-# ------------------------------------------------------------
-# RIGHT: risk, uncertainty, treatment impact & NNT
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
+# RIGHT COLUMN – RISK, UNCERTAINTY, NNT
+# -------------------------------------------------------------------
 with right:
     st.subheader("10-Year CVD Risk")
 
     st.markdown(
-        f"<h2 style='color:{risk_color}; margin-bottom:0;'>{format_percent(prob)}</h2>",
+        f"<h2 style='color:{risk_color}; margin-bottom:0;'>{format_percent(risk)}</h2>",
         unsafe_allow_html=True,
     )
     st.markdown(f"**{risk_label}**")
 
     st.caption(
-        "Risk is estimated from a logistic regression model trained on a 10,000-record "
-        "synthetic dataset with age, blood pressure, cholesterol, kidney function, diabetes, "
-        "smoking, BMI, and medication use."
+        "This risk is estimated using a Stacking GenAI model trained on a Framingham-based "
+        "dataset with GAN-balanced outcomes and 11 key risk factors. It is intended only for "
+        "education and research discussion."
     )
 
     if show_advanced:
@@ -364,126 +364,96 @@ with right:
             f"- **Median under jitter:** {format_percent(med_u)}"
         )
         st.caption(
-            "We slightly perturb numeric values (age, BP, lipids, BMI, eGFR) 200 times and "
-            "recompute risk. The band shows how sensitive the prediction is to small changes "
-            "around the current profile."
+            "We create 200 slight variations of age, lipids, BP, BMI, and eGFR around the "
+            "current values and recompute risk. This shows how sensitive the prediction is "
+            "to small measurement changes."
         )
 
-    # --------------------------------------------------------
-    # Treatment impact & NNT
-    # --------------------------------------------------------
-    st.markdown("### Estimated Treatment Impact & NNT")
+    st.markdown("### Treatment Impact & NNT (Illustrative)")
 
     st.markdown(
-        f"These estimates assume a **{RISK_HORIZON_YEARS}-year CVD risk horizon** and "
-        "average relative risk reductions from large clinical trials. "
-        "They are for **illustration and shared decision-making training only**."
+        f"Assuming a **{RISK_HORIZON_YEARS}-year** time horizon and typical relative risk "
+        "reductions from large trials. Values are approximate and for educational use only."
     )
 
-    treatments = []
-
-    # Statin therapy (assumes initiation/intensification of high-intensity statin)
-    treatments.append(
-        {
-            "name": "High-intensity statin",
-            "rrr": RRR_STATIN,
-            "description": "Assumes starting or intensifying statin therapy for lipid control.",
-        }
-    )
-
-    # Blood pressure therapy
-    treatments.append(
-        {
-            "name": "Optimized blood pressure therapy",
-            "rrr": RRR_BP,
-            "description": "Assumes achieving better BP control with guideline-directed therapy.",
-        }
-    )
-
-    rows_nnt = []
-    for t in treatments:
-        treated_risk, arr, nnt = treatment_impact(prob, t["rrr"], RISK_HORIZON_YEARS)
-
+    rows = []
+    for name, rrr, desc in [
+        ("High-intensity statin", RRR_STATIN,
+         "Lowers LDL and reduces major CVD events in many trials."),
+        ("Optimized BP therapy", RRR_BP,
+         "Achieving better BP control with guideline-directed therapy."),
+    ]:
+        treated_risk, arr, nnt = treatment_impact(risk, rrr)
         if nnt is None:
-            nnt_str = "Not meaningful at this risk level"
+            nnt_str = "Not meaningful"
         elif nnt > 2000:
             nnt_str = "> 2000"
         else:
             nnt_str = f"{nnt:.0f}"
 
-        rows_nnt.append(
-            {
-                "Therapy": t["name"],
-                "Baseline risk": format_percent(prob),
-                f"Risk with therapy\n(approx.)": format_percent(treated_risk),
-                "Absolute risk reduction\n(percentage points)": f"{(arr*100):.1f}",
-                f"NNT over {RISK_HORIZON_YEARS} yrs\n(patients)": nnt_str,
-            }
-        )
+        rows.append({
+            "Therapy": name,
+            "Baseline risk": format_percent(risk),
+            "Risk with therapy (approx.)": format_percent(treated_risk),
+            "Absolute risk reduction\n(percentage points)": f"{arr * 100:.1f}",
+            f"NNT over {RISK_HORIZON_YEARS} yrs\n(patients)": nnt_str,
+        })
 
-    st.dataframe(
-        pd.DataFrame(rows_nnt),
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
     if show_advanced:
         st.caption(
-            "NNT (Number Needed to Treat) is 1 / ARR, where ARR is the absolute risk reduction "
-            "between baseline and treated risk. For example, NNT=20 means that if 20 patients "
-            "with a profile like this are treated for the specified duration, we expect to "
-            "prevent about 1 additional CVD event on average."
+            "NNT (Number Needed to Treat) is 1 / ARR, where ARR is the absolute difference "
+            "between baseline and treated risk. For example, NNT=25 means that treating "
+            "25 patients with a similar profile for the specified duration prevents about "
+            "one additional CVD event on average."
         )
 
-# ============================================================
-# About / methodology
-# ============================================================
-with st.expander("About this app & methodology"):
+# -------------------------------------------------------------------
+# FOOTER / ABOUT
+# -------------------------------------------------------------------
+with st.expander("About this model and comparison to MDCalc-style tools"):
     st.markdown(
-        f"""
-        ### Overview
+        """
+        ### Inputs and design
 
-        - This is **CVD Predictor v3**, built on a **10,000-patient synthetic dataset** that follows
-          clinically plausible distributions for age, blood pressure, cholesterol, kidney function,
-          diabetes, smoking, BMI, and medication use.
-        - A **logistic regression model** is trained inside the app (cached) to estimate
-          **{RISK_HORIZON_YEARS}-year CVD event risk**.
-        - The dataset includes an internally generated **`cvd_event`** label, constructed via a
-          hand-crafted risk equation using these risk factors.
+        This app uses a **minimal feature set** inspired by clinical risk calculators:
 
-        ### How the synthetic outcome is generated
+        - Gender (Male/Female)  
+        - Age  
+        - Total cholesterol and HDL  
+        - Systolic blood pressure (SBP)  
+        - Diabetes (yes/no)  
+        - Current smoker (yes/no)  
+        - eGFR (synthetic but clinically plausible kidney function marker)  
+        - Use of anti-hypertensive medications (yes/no)  
+        - Statin use (yes/no)  
+        - BMI  
 
-        We compute a log-odds score using:
-        - Age, SBP, total cholesterol, HDL, BMI, eGFR  
-        - Diabetes, current smoking, and whether anti-hypertensive or statin therapy is used  
+        The outcome is a binary **10-year CVD event** (cvd_event).
 
-        The score is converted to a probability via a logistic function and used to draw
-        a Bernoulli outcome. This yields a prevalence around {format_percent(PREVALENCE)}.
+        ### Model architecture
 
-        ### Treatment impact & NNT
+        - Data derived and simplified from the **Framingham Heart Study**.  
+        - Outcomes are GAN-balanced to improve representation of CVD events.  
+        - Base models: **Random Forest, XGBoost, and a 1D CNN** on scaled features.  
+        - A **meta-learner (Logistic Regression)** combines base model predictions into a
+          **Stacking GenAI ensemble**.
 
-        - Baseline model risk is adjusted using literature-inspired **relative risk reductions (RRR)**:
-          - High-intensity statin: ~{int(RRR_STATIN*100)}% RRR  
-          - Optimized BP therapy: ~{int(RRR_BP*100)}% RRR  
-        - Treated risk = baseline risk × (1 − RRR).  
-        - **Absolute risk reduction (ARR)** = baseline − treated risk.  
-        - **Number Needed to Treat (NNT)** = 1 / ARR.
+        This Stacking GenAI model achieved an AUC of about **0.93** on held-out data in your
+        training run.
 
-        These are **simplified educational estimates** and not patient-specific treatment effects.
+        ### Disclaimer
 
-        ### Important disclaimer
-
-        - This tool is built entirely on **synthetic data**.  
-        - It is intended for **education, modelling experiments, and stakeholder demos only**.  
-        - It must **not** be used for real clinical decision-making or patient management.
+        - This app is for **education, prototyping, and research discussion only**.  
+        - It is **not** a regulated medical device and must not be used for individual
+          patient care or treatment decisions.
         """
     )
 
-st.markdown("---")
 st.markdown(
-    "<p style='text-align:center; color:gray;'>"
-    "© 2025 Howard Nguyen, PhD – Synthetic CVD Risk & NNT Demo. "
-    "Research & Demo use only."
+    "<p style='text-align:center; color:gray; margin-top:2rem;'>"
+    "© 2025 – Stacking Generative AI CVD Risk Prototype (Demonstration Use Only)"
     "</p>",
     unsafe_allow_html=True,
 )
